@@ -1,0 +1,234 @@
+---
+title: "Antimicrobial resistance surveillance analysis in R"
+subtitle: "Pathogen distribution, antibiograms, resistance by ward, trends and MDR classification"
+author: "Ahmed Hamdy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+set.seed(123)
+```
+
+## 1. Question and data
+
+**Question:** in a hospital isolate collection, which bacteria are most common,
+how resistant are they to key antibiotics, does resistance differ between wards
+and over time, and what share of isolates are multidrug-resistant?
+
+**Data:** the `example_isolates` dataset shipped with the `AMR` package: 2,000
+bacterial isolates with their antibiograms (susceptibility results as S, I or R),
+plus date, patient, age, gender and ward. It is an example dataset for the
+package, so the results illustrate the workflow and should not be read as real
+surveillance findings.
+
+```{r libs}
+library(AMR)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r data}
+iso <- example_isolates
+iso$species <- mo_name(iso$mo)
+iso$gram <- mo_gramstain(iso$mo)
+iso$year <- as.integer(format(iso$date, "%Y"))
+
+dim(iso)
+range(iso$date)
+table(iso$ward)
+```
+
+## 2. Keep one isolate per patient episode
+
+Surveillance counts should not include repeat isolates from the same patient,
+because they inflate resistance rates. `first_isolate()` keeps the first
+isolate of each patient and species episode.
+
+```{r first}
+iso$first <- first_isolate(iso)
+fi <- iso[which(iso$first), ]
+cat("All isolates:", nrow(iso), "\n")
+cat("First isolates kept:", nrow(fi), "\n")
+```
+
+## 3. Which pathogens are most common?
+
+```{r species}
+top_species <- fi %>%
+  count(species, sort = TRUE) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  head(10)
+top_species
+
+ggplot(top_species, aes(x = reorder(species, n), y = n)) +
+  geom_col(fill = "#2a9d8f") +
+  coord_flip() +
+  labs(x = NULL, y = "First isolates")
+```
+
+```{r gram}
+fi %>%
+  count(gram) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+```
+
+## 4. Antibiograms
+
+A traditional antibiogram gives the percentage of isolates susceptible (S or I)
+per species and antibiotic. Combinations that cover more isolates are useful
+for empiric therapy.
+
+```{r antibiogram}
+antibiogram(fi, antibiotics = c("AMX", "AMC", "CIP", "GEN", "TZP"))
+```
+
+Combination antibiogram by Gram stain: does adding an aminoglycoside to
+piperacillin/tazobactam improve coverage?
+
+```{r combo}
+antibiogram(fi, antibiotics = c("TZP", "TZP+GEN", "TZP+TOB"),
+            mo_transform = "gramstain")
+```
+
+## 5. Resistance in *Escherichia coli* by ward
+
+```{r ward}
+ecoli <- fi %>% filter(species == "Escherichia coli")
+abx <- c("AMX", "AMC", "CIP", "GEN", "SXT")
+
+res_tbl <- bind_rows(lapply(abx, function(ab) {
+  ecoli %>%
+    mutate(r = as.character(.data[[ab]])) %>%
+    filter(!is.na(r)) %>%
+    group_by(ward) %>%
+    summarise(antibiotic = ab, tested = n(), resistant = sum(r == "R"),
+              .groups = "drop")
+}))
+
+res_tbl <- res_tbl %>%
+  rowwise() %>%
+  mutate(pct = 100 * resistant / tested,
+         lo = 100 * prop.test(resistant, tested)$conf.int[1],
+         hi = 100 * prop.test(resistant, tested)$conf.int[2]) %>%
+  ungroup()
+
+res_tbl %>% mutate(across(c(pct, lo, hi), ~ round(.x, 1)))
+
+ggplot(res_tbl, aes(x = ward, y = pct, fill = ward)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.25) +
+  facet_wrap(~antibiotic, nrow = 1) +
+  labs(x = NULL, y = "% resistant (95% CI)") +
+  theme(legend.position = "none")
+```
+
+## 6. Resistance trend over time
+
+Ciprofloxacin resistance in *E. coli*, modelled with logistic regression on
+calendar year. The odds ratio is per additional year.
+
+```{r trend}
+trend_df <- ecoli %>%
+  mutate(r = as.character(CIP)) %>%
+  filter(!is.na(r)) %>%
+  mutate(resistant = as.integer(r == "R"),
+         year_c = year - min(year))
+
+yearly <- trend_df %>%
+  group_by(year) %>%
+  summarise(tested = n(), pct_resistant = 100 * mean(resistant))
+yearly
+
+fit_trend <- glm(resistant ~ year_c, data = trend_df, family = binomial)
+trend_or <- exp(cbind(OR_per_year = coef(fit_trend), confint.default(fit_trend)))
+round(trend_or, 3)
+summary(fit_trend)$coefficients
+
+# Fitted curve with 95% CI from the logistic model (on the link scale)
+newd <- data.frame(year_c = 0:max(trend_df$year_c))
+pr <- predict(fit_trend, newdata = newd, type = "link", se.fit = TRUE)
+newd$year <- newd$year_c + min(trend_df$year)
+newd$fit <- 100 * plogis(pr$fit)
+newd$lo <- 100 * plogis(pr$fit - 1.96 * pr$se.fit)
+newd$hi <- 100 * plogis(pr$fit + 1.96 * pr$se.fit)
+
+ggplot(yearly, aes(x = year, y = pct_resistant)) +
+  geom_ribbon(data = newd, aes(x = year, ymin = lo, ymax = hi),
+              inherit.aes = FALSE, fill = "#e76f51", alpha = 0.2) +
+  geom_line(data = newd, aes(x = year, y = fit),
+            inherit.aes = FALSE, colour = "#e76f51", linewidth = 1) +
+  geom_point(aes(size = tested)) +
+  labs(x = "Year", y = "% ciprofloxacin-resistant", size = "Isolates tested")
+```
+
+## 7. Factors associated with ciprofloxacin resistance
+
+Age is split at 65 years. A first version with three age groups gave unstable
+estimates (odds ratios in the hundreds of thousands), a sign of quasi-complete
+separation: some small groups had no resistant isolates, so the model could not
+estimate an odds ratio. The cross-tabulation below shows the counts.
+
+```{r logit}
+trend_df$age_group <- factor(ifelse(trend_df$age >= 65, "65+", "<65"),
+                             levels = c("<65", "65+"))
+table(age_group = trend_df$age_group, resistant = trend_df$resistant)
+table(ward = trend_df$ward, resistant = trend_df$resistant)
+
+fit <- glm(resistant ~ ward + gender + age_group, data = trend_df,
+           family = binomial)
+round(exp(cbind(OR = coef(fit), confint.default(fit))), 2)
+```
+
+## 8. Multidrug-resistant organisms (MDR)
+
+`mdro()` classifies each isolate by international consensus definitions
+(default: Magiorakos et al. 2012, CMI).
+
+```{r mdro}
+fi$mdr <- mdro(fi)
+table(fi$mdr)
+
+mdr_ward <- fi %>%
+  count(ward, mdr) %>%
+  group_by(ward) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+mdr_ward
+
+ggplot(mdr_ward, aes(x = ward, y = percent, fill = mdr)) +
+  geom_col() +
+  labs(x = NULL, y = "% of first isolates", fill = "Class")
+```
+
+## 9. Export
+
+```{r export}
+dir.create("results", showWarnings = FALSE)
+write.csv(res_tbl, "results/ecoli_resistance_by_ward.csv", row.names = FALSE)
+write.csv(yearly, "results/ecoli_cip_resistance_by_year.csv", row.names = FALSE)
+write.csv(mdr_ward, "results/mdr_by_ward.csv", row.names = FALSE)
+```
+
+## 10. Limitations
+
+- The data are an example dataset shipped with a software package, so the numbers
+  illustrate the workflow and are not real surveillance results.
+- Some species-antibiotic-ward groups have few isolates, so confidence intervals
+  are wide.
+- The trend model is a simple logistic regression and ignores changes in testing
+  practice over time.
+- Resistance is reported for first isolates only; clinical breakpoints and
+  intrinsic resistance rules follow the `AMR` package defaults.
+
+## 11. Reproducibility
+
+```{r session}
+sessionInfo()
+```

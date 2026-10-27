@@ -1,0 +1,10 @@
+"ward","mdr","n","percent"
+"Clinical","Negative",715,84.1
+"Clinical","Multi-drug-resistant (MDR)",48,5.6
+"Clinical",NA,87,10.2
+"ICU","Negative",358,81
+"ICU","Multi-drug-resistant (MDR)",31,7
+"ICU",NA,53,12
+"Outpatient","Negative",87,91.6
+"Outpatient","Multi-drug-resistant (MDR)",2,2.1
+"Outpatient",NA,6,6.3
